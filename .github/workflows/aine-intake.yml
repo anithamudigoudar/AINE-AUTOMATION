@@ -1,0 +1,199 @@
+name: AINE Intake (Spec Kit)
+
+# Started by the AINE Forge app (repository_dispatch) with a run ticket for the user who
+# triggered it in Confluence. Every Confluence call and every Copilot call runs as that user.
+
+on:
+  repository_dispatch:
+    types: [aine-initiate-specs, aine-requirement-initiate, aine-requirement-update, aine-specs-update, aine-specs-approve]
+  workflow_dispatch:
+    inputs:
+      page_id:
+        description: BRD or spec page ID
+        required: true
+      event:
+        description: aine-requirement-initiate | aine-requirement-update | aine-specs-update | aine-specs-approve
+        default: aine-requirement-initiate
+      ticket:
+        description: Run ticket (set by AINE; leave empty for manual runs with fallback secrets)
+        required: false
+        default: ''
+      site:
+        description: Site name = GitHub Environment holding that site's proxy URL
+        required: true
+
+concurrency:
+  group: aine-intake-${{ github.event.client_payload.site || inputs.site }}-${{ github.event.client_payload.page_id || inputs.page_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PAGE_ID: ${{ github.event.client_payload.page_id || inputs.page_id }}
+  EVENT: ${{ github.event.action || inputs.event }}
+  AINE_TICKET: ${{ github.event.client_payload.ticket || inputs.ticket }}
+  BY: ${{ github.event.client_payload.by || github.actor }}
+  SITE: ${{ github.event.client_payload.site || inputs.site }}
+  SPEC_TITLE_PREFIX: ${{ vars.SPEC_TITLE_PREFIX }}
+  BRD_TITLE_PREFIX: ${{ vars.BRD_TITLE_PREFIX }}
+  DESIGN_TITLE_PREFIXES: ${{ vars.DESIGN_TITLE_PREFIXES }}
+  SPECKIT_REF: ${{ vars.SPECKIT_REF }}
+  COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
+  # Optional fallback for manual runs WITHOUT a ticket (leave these secrets unset to disallow)
+  CONF_BASE: ${{ vars.CONFLUENCE_BASE }}
+  CONF_EMAIL: ${{ secrets.CONFLUENCE_EMAIL }}
+  CONF_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+  COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+
+jobs:
+  intake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # One GitHub Environment per Confluence site; it holds that site's proxy URL and secret
+    environment: ${{ github.event.client_payload.site || inputs.site }}
+    env:
+      # Confluence access goes through the site's Forge proxy, as the triggering user
+      AINE_PROXY_URL: ${{ secrets.AINE_PROXY_URL }}
+      AINE_PROXY_SECRET: ${{ secrets.AINE_PROXY_SECRET }}
+    steps:
+      - name: Mask run ticket
+        run: '[ -n "$AINE_TICKET" ] && echo "::add-mask::$AINE_TICKET" || true'
+
+      - name: Map the Confluence label to an action
+        run: |
+          case "$EVENT" in
+            aine-requirement-initiate|aine-initiate-specs) A=initiate ;;
+            aine-requirement-update)                       A=brd-update ;;
+            aine-specs-update|aine-specs-change)           A=specs-update ;;
+            aine-specs-approve|aine-specs-approved)        A=approve ;;
+            *) echo "::error::Unknown event: $EVENT"; exit 1 ;;
+          esac
+          echo "ACTION=$A" >> "$GITHUB_ENV"
+          echo "Event '$EVENT' -> action '$A' (site $SITE, page $PAGE_ID, by $BY)"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq pandoc jq
+          if [ "$ACTION" != "approve" ]; then
+            npm install -g @github/copilot
+            uv tool install specify-cli --from "git+https://github.com/github/spec-kit.git@${SPECKIT_REF}"
+            copilot --version && specify --help >/dev/null
+          fi
+
+      - name: Read the BRD, the existing spec and its comments
+        id: prep
+        run: python3 aine/scripts/aine_confluence.py prepare --page "$PAGE_ID" --work work
+
+      # ------------------------------------------------------------------ approve
+      - name: Baseline the spec (approved)
+        if: env.ACTION == 'approve'
+        run: python3 aine/scripts/aine_confluence.py approve --work work
+
+      - id: app
+        if: env.ACTION == 'approve'
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.AINE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AINE_APP_PRIVATE_KEY }}
+          permission-actions: write
+
+      - name: Start the Design workflow (same user, same ticket)
+        if: env.ACTION == 'approve'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          gh workflow run aine-design.yml --repo "$GITHUB_REPOSITORY" \
+            -f page_id="${{ steps.prep.outputs.brd_id }}" -f event=aine-design-start \
+            -f ticket="$AINE_TICKET" -f by="$BY" -f site="$SITE"
+
+      # ------------------------------------------------------------------ spec
+      - name: Initialise and configure Spec Kit
+        if: env.ACTION != 'approve'
+        env:
+          FEATURE: ${{ steps.prep.outputs.feature }}
+          MODE: ${{ steps.prep.outputs.mode }}
+        run: |
+          specify init --here --integration copilot --script sh --force --ignore-agent-tools \
+            || specify init --here --ai copilot --script sh --force --ignore-agent-tools
+          cp aine/speckit/constitution.md .specify/memory/constitution.md
+          cat aine/speckit/spec-template-aine-sections.md >> .specify/templates/spec-template.md
+          SPECIFY_SKILL=$(find .github -type f -ipath '*speckit*specify*' | head -1)
+          CLARIFY_SKILL=$(find .github -type f -ipath '*speckit*clarify*' | head -1)
+          [ -n "$SPECIFY_SKILL" ] && [ -n "$CLARIFY_SKILL" ] || { echo "::error::Spec Kit skill files not found"; find .github -type f; exit 1; }
+          mkdir -p "specs/$FEATURE"
+          [ "$MODE" = "update" ] && cp work/spec-current.md "specs/$FEATURE/spec.md"
+          {
+            echo "SPECIFY_SKILL=$SPECIFY_SKILL"
+            echo "CLARIFY_SKILL=$CLARIFY_SKILL"
+            echo "SPECIFY_FEATURE=$FEATURE"
+            echo "FEATURE=$FEATURE"
+          } >> "$GITHUB_ENV"
+          echo "Spec Kit ready: $SPECIFY_SKILL, $CLARIFY_SKILL, MODE=$MODE"
+
+      - name: Generate or update the spec (Copilot as the triggering user)
+        if: env.ACTION != 'approve'
+        env:
+          MODE: ${{ steps.prep.outputs.mode }}
+          BRD_TITLE: ${{ steps.prep.outputs.brd_title }}
+          BRD_VERSION: ${{ steps.prep.outputs.brd_version }}
+          BRD_URL: ${{ steps.prep.outputs.brd_url }}
+        run: |
+          if [ "$MODE" = "new" ]; then T=specify-new
+          elif [ "$ACTION" = "specs-update" ]; then T=specs-update
+          else T=clarify-brd; fi
+          echo "Prompt: $T"
+          python3 aine/scripts/render_prompt.py "aine/prompts/$T.md" > work/prompt.md
+          cp work/prompt.md "work/prompt-$T.md"
+          bash aine/scripts/run_copilot.sh work/prompt.md "$T"
+          test -s "specs/$FEATURE/spec.md" || { echo "::error::Copilot did not write specs/$FEATURE/spec.md"; exit 1; }
+          cp "specs/$FEATURE/spec.md" work/spec-new.md
+
+      - name: Publish the spec, label it for review, update the BRD comment and labels
+        if: env.ACTION != 'approve'
+        run: python3 aine/scripts/aine_confluence.py publish-spec --work work --spec-md work/spec-new.md --action "$ACTION"
+
+      # ------------------------------------------------------------------ spec → BRD (specs-update only)
+      - name: Analyse the edited spec and draft the BRD sections
+        if: env.ACTION == 'specs-update'
+        continue-on-error: true
+        run: |
+          python3 aine/scripts/render_prompt.py aine/prompts/brd-fill.md > work/prompt-brd-fill.md
+          bash aine/scripts/run_copilot.sh work/prompt-brd-fill.md brd-fill
+
+      - name: Update the BRD from the edited spec
+        if: env.ACTION == 'specs-update'
+        continue-on-error: true
+        run: python3 aine/scripts/aine_confluence.py brd-fill --work work --fill work/brd-fill.md --spec-md work/spec-new.md
+
+      - name: Send business changes back to the BRD
+        if: env.ACTION == 'specs-update'
+        run: python3 aine/scripts/aine_confluence.py business-changes --work work --file work/business-changes.md
+
+      # ------------------------------------------------------------------ always
+      - name: Keep inputs, Spec Kit output and transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aine-${{ env.SITE }}-${{ env.PAGE_ID }}-${{ github.run_id }}
+          path: |
+            work/
+            specs/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Revoke run ticket
+        if: always() && env.ACTION != 'approve'
+        run: python3 aine/scripts/aine_confluence.py revoke || true
