@@ -1,0 +1,124 @@
+name: AINE Design (Stage 2)
+
+# design-start  : started by aine-intake.yml when the spec is approved (same user, same ticket)
+#                 → drafts HLD, Infra Design, Cloud Design and Project Plan under the BRD
+# design-update : aine-design-update label on one design page (via the AINE Forge app)
+#                 → regenerates that page with the review comments
+# design-approve: aine-design-approve label on one design page → records the approval
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_id:
+        description: BRD page ID (design-start) or design page ID (update / approve)
+        required: true
+      event:
+        description: aine-design-start | aine-design-update | aine-design-approve
+        default: aine-design-start
+      ticket:
+        description: Run ticket (set by AINE)
+        required: false
+        default: ''
+      by:
+        description: Who triggered it
+        required: false
+        default: ''
+      site:
+        description: Site name = GitHub Environment holding that site's proxy URL
+        required: true
+  repository_dispatch:
+    types: [aine-design-update, aine-design-approve]
+
+concurrency:
+  group: aine-design-${{ github.event.client_payload.site || inputs.site }}-${{ github.event.client_payload.page_id || inputs.page_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PAGE_ID: ${{ github.event.client_payload.page_id || inputs.page_id }}
+  EVENT: ${{ github.event.action || inputs.event }}
+  AINE_TICKET: ${{ github.event.client_payload.ticket || inputs.ticket }}
+  BY: ${{ github.event.client_payload.by || inputs.by || github.actor }}
+  SITE: ${{ github.event.client_payload.site || inputs.site }}
+  SPEC_TITLE_PREFIX: ${{ vars.SPEC_TITLE_PREFIX }}
+  BRD_TITLE_PREFIX: ${{ vars.BRD_TITLE_PREFIX }}
+  DESIGN_TITLE_PREFIXES: ${{ vars.DESIGN_TITLE_PREFIXES }}
+  COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
+  CONF_BASE: ${{ vars.CONFLUENCE_BASE }}
+  CONF_EMAIL: ${{ secrets.CONFLUENCE_EMAIL }}
+  CONF_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+  COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+
+jobs:
+  design:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: ${{ github.event.client_payload.site || inputs.site }}
+    env:
+      AINE_PROXY_URL: ${{ secrets.AINE_PROXY_URL }}
+      AINE_PROXY_SECRET: ${{ secrets.AINE_PROXY_SECRET }}
+    steps:
+      - name: Mask run ticket
+        run: '[ -n "$AINE_TICKET" ] && echo "::add-mask::$AINE_TICKET" || true'
+
+      - name: Map the event
+        run: |
+          case "$EVENT" in
+            aine-design-start|aine-design-update|aine-design-approve) ;;
+            *) echo "::error::Unknown event: $EVENT"; exit 1 ;;
+          esac
+          echo "Event '$EVENT' (site $SITE, page $PAGE_ID, by $BY)"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq pandoc jq
+          [ "$EVENT" = "aine-design-approve" ] || npm install -g @github/copilot
+
+      - name: Read the BRD, the approved spec and the design page
+        id: prep
+        run: python3 aine/scripts/aine_confluence.py design-prepare --page "$PAGE_ID" --work work
+
+      - name: Record design approval
+        if: env.EVENT == 'aine-design-approve'
+        run: python3 aine/scripts/aine_confluence.py design-approve --work work
+
+      - name: Draft and publish the design documents (Copilot as the triggering user)
+        if: env.EVENT != 'aine-design-approve'
+        env:
+          KINDS: ${{ steps.prep.outputs.kinds }}
+        run: |
+          declare -A TITLES=([hld]="High-Level Design" [infra]="Infrastructure Design" [cloud]="Cloud Design" [plan]="Project Plan")
+          BRD_TITLE=$(jq -r .brd.title work/meta.json)
+          export BRD_TITLE
+          for kind in ${KINDS//,/ }; do
+            export DESIGN_KIND="$kind" DESIGN_TITLE="${TITLES[$kind]}" OUT_FILE="work/design-$kind.md"
+            python3 aine/scripts/render_prompt.py aine/prompts/design.md > "work/prompt-design-$kind.md"
+            bash aine/scripts/run_copilot.sh "work/prompt-design-$kind.md" "design-$kind"
+            test -s "$OUT_FILE" || { echo "::error::Copilot did not write $OUT_FILE"; exit 1; }
+            python3 aine/scripts/aine_confluence.py design-publish --work work --kind "$kind" --md "$OUT_FILE"
+          done
+
+      - name: Keep inputs, output and transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aine-design-${{ env.SITE }}-${{ env.PAGE_ID }}-${{ github.run_id }}
+          path: work/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Revoke run ticket
+        if: always()
+        run: python3 aine/scripts/aine_confluence.py revoke || true
